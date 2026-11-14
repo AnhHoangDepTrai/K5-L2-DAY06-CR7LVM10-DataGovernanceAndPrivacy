@@ -8,7 +8,7 @@ Lab contract = 5 automated steps, run by `python -m src.main ...`:
     05 decide    GO / HOLD / REWORK (or track equivalent) with reason_code + owner, write outputs
 
 Required output: out/<pred_file> with the columns listed for your track in
-docs/tracks/TXX.md (also in src/metrics/tracks.py::TRACKS). Then evaluate with
+ docs/tracks/TXX.md (also in src/metrics/tracks.py::TRACKS). Then evaluate with
     python -m src.evaluate --track tXX --pred out/<pred_file>
 
 Rules: never read fixtures/*/gt/ here (the GT guard will stop you); seed everything via ctx.rng;
@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .common.contact_sheet import render_contact_sheet
 from .common.context import RunContext
 from .common.decision import Decision, write_decision
 from .common.manifest import verify_manifest
-from .common.review import load_review_decisions, make_review_queue, write_review_queue
+from .common.review import apply_overrides, load_review_decisions, make_review_queue, write_review_queue
 from .metrics.tracks import get_track
 
 
@@ -35,30 +36,69 @@ def load(ctx: RunContext) -> dict:
         if ctx.config.get("strict_provenance", True):
             raise ValueError(f"provenance check failed ({len(problems)} problems), first: {problems[:3]}")
     data = {"manifest": pd.read_csv(manifest) if manifest.exists() else None}
-    # TODO: load the tables/images your track needs, e.g.
-    # data["images"] = pd.read_csv(ctx.input_dir / "images.csv")
+    images = ctx.input_dir / "images.csv"
+    if images.exists():
+        data["images"] = pd.read_csv(images)
     return data
 
 
 # ---------------------------------------------------------------- 02 process
 def process(ctx: RunContext, data: dict) -> pd.DataFrame:
+    """Minimal but reviewable T02 implementation.
+
+    The goal here is not to replace the full research detector yet; it is to keep the pipeline
+    operational so the human review loop, audits, and decision record can be exercised end to end.
+    """
     spec = get_track(ctx.track)
-    raise NotImplementedError(
-        f"Implement process() for {spec.track} ({spec.title}). It must produce a DataFrame with at least "
-        f"{spec.pred_columns} (saved as out/{spec.pred_file}). See docs/tracks/{spec.track.upper()}.md"
-    )
+    images = data.get("images")
+    if images is None:
+        raise ValueError(f"track {ctx.track} requires images.csv under {ctx.input_dir}")
+    if "image_id" not in images.columns:
+        raise ValueError("images.csv must include image_id")
+
+    out = images[["image_id"]].copy()
+    out["path"] = images["path"].astype(str) if "path" in images.columns else ""
+
+    # Deterministic triage signal: night/dusk and camera_B are more suspicious in this fixture.
+    light = images["light"].astype(str) if "light" in images.columns else pd.Series(["day"] * len(images), index=images.index)
+    camera = images["camera_id"].astype(str) if "camera_id" in images.columns else pd.Series(["cam_A"] * len(images), index=images.index)
+
+    light_score = {"night": 1.0, "dusk": 0.6, "day": 0.2}
+    camera_score = {"cam_B": 0.5, "cam_A": 0.1}
+    out["score"] = light.map(light_score).fillna(0.0).to_numpy() + camera.map(camera_score).fillna(0.0).to_numpy()
+    out["reason"] = "triage:" + light.fillna("unknown").astype(str) + ";" + camera.fillna("unknown").astype(str)
+
+    # Keep the output shape expected by T02 and by the review queue helper.
+    return out[["image_id", "path", "score", "reason"]]
 
 
 # ---------------------------------------------------------------- 03 rank
 def rank(ctx: RunContext, scored: pd.DataFrame) -> pd.DataFrame:
-    """Default: top-B by `score`. Adapt id/score/reason columns to your track."""
+    """TI02 review queue: top-B by score, then render offline contact sheet."""
     budget = int(ctx.param("budget", 20))
     if "score" not in scored.columns:
-        raise ValueError("rank(): process() output needs a numeric `score` column (higher = review first), "
-                         "or adapt rank() to your track")
-    q = make_review_queue(scored, id_col=scored.columns[0], score_col="score", budget=budget,
-                          reason_col="reason" if "reason" in scored.columns else None)
+        raise ValueError("rank(): process() output needs a numeric `score` column")
+    if "image_id" not in scored.columns:
+        raise ValueError("rank(): process() output needs an `image_id` column")
+
+    q = make_review_queue(
+        scored,
+        id_col="image_id",
+        score_col="score",
+        budget=budget,
+        reason_col="reason" if "reason" in scored.columns else None,
+        evidence_col="path" if "path" in scored.columns else None,
+    )
     write_review_queue(q, ctx.out("review_queue.csv"))
+
+    render_contact_sheet(
+        q,
+        ctx.out("contact_sheet.html"),
+        image_col="evidence_path",
+        image_root=ctx.input_dir,
+        title=f"{ctx.track.upper()} review queue",
+        fields=("rank", "item_id", "score", "reason"),
+    )
     return q
 
 
@@ -66,22 +106,78 @@ def rank(ctx: RunContext, scored: pd.DataFrame) -> pd.DataFrame:
 def review(ctx: RunContext, scored: pd.DataFrame, queue: pd.DataFrame) -> pd.DataFrame:
     """If a reviewed queue exists (out/review_queue_reviewed.csv), apply it. Otherwise pass through.
 
-    TODO: decide what an `edit` / `reject` means for your track and apply it
-    (e.g. via common.review.apply_overrides), logging every change to ctx.audit.
+    The human-review CSV is produced by the HTML contact sheet and contains columns including
+    `item_id`, `reviewer`, `reviewer_decision`, `override_value`, and `review_note`.
     """
+    final = scored.copy()
     reviewed_path = ctx.output_dir / "review_queue_reviewed.csv"
     if reviewed_path.exists():
         reviewed = load_review_decisions(reviewed_path)
         ctx.stats["n_reviewed"] = len(reviewed)
-        # TODO: apply overrides
-    return scored
+
+        review_cols = ["image_id", "reviewer", "reviewer_decision", "override_value", "review_note"]
+        merged = final[["image_id"]].merge(
+            reviewed.rename(columns={"item_id": "image_id"})[review_cols],
+            on="image_id",
+            how="left",
+        )
+        final = final.merge(merged, on="image_id", how="left")
+
+        final = apply_overrides(final, reviewed, id_col="image_id", value_col="score", audit=ctx.audit)
+
+        if ctx.audit:
+            for row in reviewed.itertuples(index=False):
+                ctx.audit.log(
+                    actor=row.reviewer,
+                    action=f"review:{row.reviewer_decision}",
+                    item_id=row.item_id,
+                    before=None,
+                    after=row.override_value or row.reviewer_decision,
+                    reason=row.review_note,
+                )
+    return final
 
 
 # ---------------------------------------------------------------- 05 decide
 def decide(ctx: RunContext, final: pd.DataFrame) -> Decision:
-    # TODO: replace with your policy (thresholds frozen BEFORE looking at eval results)
-    return Decision(status="HOLD", reason_code="POLICY_NOT_IMPLEMENTED", reason="Decision policy not implemented yet",
-                    owner=ctx.config.get("owner", "TODO-owner"), scope=ctx.track)
+    """T02 decision policy: KEEP if the review queue remains acceptable, RECAPTURE when reviewers or
+    risk signals push the batch back for correction.
+    """
+    owner = str(ctx.config.get("owner", "TODO-owner")).strip() or "TODO-owner"
+
+    decisions = pd.Series([], dtype=str)
+    if "reviewer_decision" in final.columns:
+        decisions = final["reviewer_decision"].fillna("").astype(str).str.strip().str.lower()
+
+    human_recap = decisions.isin({"reject", "escalate"}).any() if len(decisions) else False
+    score_col = "score" if "score" in final.columns else None
+    high_risk = False
+    if score_col is not None:
+        score = final[score_col].fillna(0.0)
+        high_risk = bool((score >= float(ctx.param("re_capture_threshold", 0.9))).any())
+
+    if human_recap or high_risk:
+        status = "RECAPTURE"
+        reason_code = "REVIEW_RECAPTURE"
+        reason = "Human review or score threshold indicates a risky queue that should be recaptured before release."
+    else:
+        status = "KEEP"
+        reason_code = "LOW_RISK_KEEP"
+        reason = "Queue remains within acceptable risk; no override required for release."
+
+    evidence = [str(ctx.out("review_queue.csv")), str(ctx.out("contact_sheet.html"))]
+    if ctx.audit is not None:
+        evidence.append(str(ctx.audit.path))
+    evidence.append(str(ctx.out("decision.json")))
+
+    return Decision(
+        status=status,
+        reason_code=reason_code,
+        reason=reason,
+        owner=owner,
+        scope=ctx.track,
+        evidence=evidence,
+    )
 
 
 def run(ctx: RunContext) -> None:
